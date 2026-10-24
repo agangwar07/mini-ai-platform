@@ -1,0 +1,28 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: tenants
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - git:
+        repoURL: https://github.com/agangwar07/mini-ai-platform
+        revision: main
+        directories:
+          - path: tenants/*
+          - path: tenants/base
+            exclude: true
+  template:
+    metadata:
+      name: 'tenant-{{.path.basename}}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/agangwar07/mini-ai-platform
+        targetRevision: main
+        path: '{{.path.path}}'
+      destination:
+        server: https://kubernetes.default.svc
+      syncPolicy:
+        automated: { prune: true, selfHeal: true }

@@ -1,0 +1,39 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+spec:
+  background: true
+  rules:
+    - name: require-tag
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.io/tenant
+                    operator: Exists
+      validate:
+        failureAction: Enforce
+        message: "Images must have an explicit tag."
+        pattern:
+          spec:
+            containers:
+              - image: "*:*"
+    - name: no-latest
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.io/tenant
+                    operator: Exists
+      validate:
+        failureAction: Enforce
+        message: "Pin an image tag; ':latest' is not allowed."
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"
