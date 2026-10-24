@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web
+  namespace: team-turbines
+  labels: { app: web }
+spec:
+  containers:
+    - name: nginx
+      image: nginx:1.27
+      resources: { limits: { cpu: 200m, memory: 128Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: team-turbines
+spec:
+  selector: { app: web }
+  ports: [{ port: 80 }]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: team-grid
+spec:
+  containers:
+    - name: curl
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "infinity"]
+      resources: { limits: { cpu: 100m, memory: 64Mi } }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: team-turbines
+spec:
+  containers:
+    - name: curl
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "infinity"]
+      resources: { limits: { cpu: 100m, memory: 64Mi } }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fake-model
+  namespace: team-grid
+  labels: { platform.io/workload: inference }
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27
+      resources: { limits: { cpu: 200m, memory: 128Mi } }
