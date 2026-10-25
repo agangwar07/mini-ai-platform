@@ -1,0 +1,37 @@
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen
+  annotations:
+    serving.kserve.io/deploymentMode: Standard
+    serving.kserve.io/autoscalerClass: keda
+spec:
+  predictor:
+    labels:
+      platform.io/workload: inference
+    minReplicas: 1
+    maxReplicas: 2
+    autoScaling:
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 60
+    model:
+      modelFormat:
+        name: huggingface
+      storageUri: hf://Qwen/Qwen2.5-0.5B-Instruct
+      args:
+        - --model_name=qwen
+        - --backend=huggingface
+        - --dtype=float32
+        - --max_model_len=2048
+      resources:
+        requests:
+          cpu: "1"
+          memory: 3Gi
+        limits:
+          cpu: "2"
+          memory: 4Gi

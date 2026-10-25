@@ -4,3 +4,18 @@ namespace: team-grid
 resources:
   - namespace.yaml
   - ../base
+  - models/qwen.yaml
+patches:
+  - target:
+      kind: ResourceQuota
+      name: tenant-quota
+    patch: |-
+      - op: replace
+        path: /spec/hard/requests.cpu
+        value: "4"
+      - op: replace
+        path: /spec/hard/requests.memory
+        value: 8Gi
+      - op: replace
+        path: /spec/hard/limits.memory
+        value: 12Gi
