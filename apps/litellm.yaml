@@ -14,10 +14,8 @@ spec:
         fullnameOverride: litellm
         replicaCount: 1
         serviceAccount:
-          create: true
+          create: false
           name: litellm
-          annotations:
-            eks.amazonaws.com/role-arn: arn:aws:iam::416338380738:role/mini-ai-litellm-bedrock
         volumes:
           - name: aws-iam-token
             projected:
