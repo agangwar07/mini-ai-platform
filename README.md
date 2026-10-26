@@ -10,8 +10,8 @@ Everything in the cluster is declared in this repo and deployed by Argo CD. The 
 | --- | --- | --- |
 | 1 | GitOps multi-tenant cluster | Done |
 | 2 | Model serving with KServe and KEDA | Done |
-| 3 | LLM gateway | Next |
-| 4 | Bedrock RAG with Guardrails | Planned |
+| 3 | LLM gateway, secrets from AWS Secrets Manager, keyless AWS access | Done |
+| 4 | Bedrock RAG with Guardrails | Blocked: AWS has Bedrock quotas at 0 on this account (support case open) |
 | 5 | Kubernetes ops agent over MCP | Planned |
 | 6 | OpenTelemetry for LLM workloads | Planned |
 | 7 | Eval-gated canary and governance pack | Planned |
@@ -30,6 +30,15 @@ flowchart TD
     ISVC --> KServe[KServe controller]
     KServe --> Deploy[Deployment + Service<br/>on inference node]
     KServe --> SO[KEDA ScaledObject]
+    Root --> GW[gateway namespace]
+    GW --> LiteLLM[LiteLLM gateway<br/>teams, keys, budgets, fallbacks]
+    GW --> PG[(Postgres)]
+    GW --> ESO[ExternalSecrets]
+    ESO -.->|web identity| SM[(AWS Secrets Manager)]
+    LiteLLM --> Deploy
+    LiteLLM -.->|web identity| Bedrock[Amazon Bedrock]
+    LiteLLM -.->|API key from Secrets Manager| Gemini[Google Gemini API]
+    LiteLLM -.-> Langfuse[Langfuse Cloud]
 ```
  
 ## Repo layout
@@ -39,6 +48,8 @@ flowchart TD
 clusters/kind/          kind cluster config and the root Argo CD Application
 apps/                   One Argo CD Application per platform component (app-of-apps)
 platform/policies/      Kyverno ClusterPolicies
+platform/gateway/       Gateway namespace, Postgres, service accounts, SecretStore, ExternalSecrets
+scripts/kind-oidc.sh    Turns the kind API server into a public OIDC issuer for AWS federation
 tenants/base/           Shared tenant guardrails: quota, limit range, network policies
 tenants/<team>/         One folder per tenant; adding a folder onboards a tenant
 tenants/team-grid/models/   Models the team-grid tenant serves
@@ -69,6 +80,17 @@ kubectl -n argocd create secret generic repo-mini-ai-platform \
 kubectl -n argocd label secret repo-mini-ai-platform argocd.argoproj.io/secret-type=repository
  
 kubectl apply -f clusters/kind/root.yaml
+```
+ 
+From Lab 3 onwards, the cluster must also be trusted by AWS. A new kind cluster has new signing keys, so after every cluster rebuild, re-point the API server at the issuer and republish its keys (values come from the git-ignored `.lab-env`; see Lab 3 for the one-time AWS setup):
+ 
+```bash
+source .lab-env
+./scripts/kind-oidc.sh "$ISSUER"
+kubectl get --raw /.well-known/openid-configuration > /tmp/discovery.json
+kubectl get --raw /openid/v1/jwks > /tmp/jwks.json
+aws s3 cp /tmp/discovery.json s3://$BUCKET/.well-known/openid-configuration --content-type application/json
+aws s3 cp /tmp/jwks.json s3://$BUCKET/openid/v1/jwks --content-type application/json
 ```
  
 Argo CD UI: `kubectl port-forward svc/argocd-server -n argocd 8080:80`, user `admin`, password from `argocd admin initial-password -n argocd`.
@@ -182,8 +204,128 @@ Measured cold start for a new replica: _add your measurement_.
 ### What changes in production
  
 - GPU node pools with vLLM as the backend, scaling on vLLM metrics such as running or waiting requests
-- Model weights cached on nodes or in a shared volume (KServe LocalModelCache) to cut cold starts, instead of downloading from Hugging Face on every startACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+- Model weights cached on nodes or in a shared volume (KServe LocalModelCache) to cut cold starts, instead of downloading from Hugging Face on every start
 - Model sources restricted to an internal registry or storage account, not the public Hugging Face Hub
 - Tenant quotas sized from capacity plans and GPU availability, not fixed numbers
+---
  
-
+## Lab 3: LLM gateway with keyless cloud access
+ 
+### What was built
+ 
+**The gateway (`gateway` namespace, labelled `platform.io/role: gateway`):**
+ 
+- **LiteLLM proxy**, deployed by Argo CD from its OCI Helm chart (`ghcr.io/berriai/litellm-helm`), with one OpenAI-compatible endpoint for every model.
+- **Postgres** (a StatefulSet with a 2 GiB volume) holding LiteLLM's teams, keys and spend records. The chart's own migrations job creates the schema.
+- **A model catalog of stable aliases.** Apps call the alias; the backend behind it can change without any app change.
+| Alias | Backend | Notes |
+| --- | --- | --- |
+| `local-small` | KServe `qwen` in `team-grid` (Lab 2) | Given an internal per-token price so self-hosted usage shows up in chargeback |
+| `bedrock-small` | Amazon Nova Micro via the `apac.` cross-region inference profile | Configured and authorised, but blocked by AWS on this account (see Issues) |
+| `gemini-small` | `gemini-3.5-flash-lite` on the Gemini API free tier | Stand-in second provider while Bedrock is blocked |
+ 
+- **Fallbacks:** `local-small` falls back to `gemini-small`, then `bedrock-small`. `bedrock-small` falls back to `gemini-small`.
+- **Tenants as LiteLLM teams**, one key per application:
+| Team | Models | Budget | Limits |
+| --- | --- | --- | --- |
+| `team-grid` | local-small, bedrock-small, gemini-small | $2 | 20,000 tokens/min, 60 requests/min |
+| `team-turbines` | bedrock-small, gemini-small | $1 | 2,000 tokens/min, 3 requests/min |
+ 
+- **Tracing** of every request to Langfuse Cloud through LiteLLM's `langfuse_otel` callback.
+**Secrets: AWS Secrets Manager with External Secrets Operator:**
+ 
+- One JSON secret, `mini-ai-platform/gateway/litellm`, holds the database credentials, LiteLLM master key, salt key, Langfuse keys and Gemini API key. Values were generated straight into Secrets Manager and never written to a file or to Git.
+- External Secrets Operator (installed by Argo CD) syncs it every minute into the three Kubernetes Secrets the chart and Postgres expect: `litellm-db`, `litellm-masterkey`, `litellm-env`.
+- The SecretStore is **namespaced to `gateway`**, so this namespace can only reach its own secret path.
+**Keyless AWS access: workload identity federation outside EKS:**
+ 
+- `scripts/kind-oidc.sh` makes the kind API server issue service account tokens for a public issuer URL. Its OIDC discovery document and JWKS are published to an S3 bucket that exposes only those two files.
+- AWS IAM trusts that issuer as an OIDC identity provider. Two roles are each pinned to one service account (`sub`) and to the `sts.amazonaws.com` audience (`aud`):
+| Role | Service account | Permissions |
+| --- | --- | --- |
+| `mini-ai-eso-gateway` | `gateway/eso-gateway` | Read secrets under `mini-ai-platform/gateway/` |
+| `mini-ai-litellm-bedrock` | `gateway/litellm` | Invoke Nova Micro (model and inference profile) |
+ 
+- ESO exchanges a short-lived token for `eso-gateway` with STS (the SecretStore's `jwt` auth). LiteLLM gets a projected service account token plus `AWS_ROLE_ARN` and `AWS_WEB_IDENTITY_TOKEN_FILE`, so the AWS SDK assumes its role by itself. This is exactly what IRSA injects on EKS, done by hand.
+- **Result: no AWS access keys exist anywhere in the cluster, the repo or the gateway's secrets.**
+### One-time AWS setup
+ 
+Done with a temporary admin CLI profile, which was removed afterwards:
+ 
+1. S3 bucket `mini-ai-oidc-<account-id>` (ap-south-1) with a bucket policy that makes only `.well-known/openid-configuration` and `openid/v1/jwks` public
+2. IAM OIDC identity provider for the bucket URL, audience `sts.amazonaws.com`
+3. The two roles above, with trust policies pinned to service accounts and inline least-privilege policies
+4. The Secrets Manager secret `mini-ai-platform/gateway/litellm`
+5. A $10 monthly AWS budget with an alert at 80%
+### Design decisions
+ 
+- **The gateway is the only path to models.** Lab 1's NetworkPolicy lets only the gateway namespace into tenant namespaces, so keys, limits, budgets and logs can't be bypassed.
+- **Aliases instead of provider model names.** `bedrock-small` kept its name while its backend was blocked, and was served by Gemini through fallback. No app noticed.
+- **Teams map to tenants; keys map to applications.** Limits and budgets live on the team; the key alias identifies the app in logs and traces.
+- **Workload identities are owned by the platform layer.** The `litellm` and `eso-gateway` service accounts and their role annotations live in `platform/gateway/`, not in the chart, so the IAM-to-service-account mapping is reviewed in one place. This also fixed a hook-ordering bug (see Issues).
+- **Namespaced SecretStore per namespace, not a cluster-wide store,** so a compromise in one namespace can't read another's secrets.
+- **LiteLLM spend is the system of record for cost.** Langfuse records both the requested alias and the model that actually ran, which double-labels traffic in its cost view. Chargeback uses the gateway's per-team spend; Langfuse is for tracing and debugging.
+### Verification
+ 
+| Test | Result |
+| --- | --- |
+| STS `AssumeRoleWithWebIdentity` with a token for `gateway/eso-gateway` | Succeeded |
+| Same role with a token for `team-turbines/default` | `AccessDenied` (trust policy pinned to one service account) |
+| SecretStore and ExternalSecrets | `Valid` / `SecretSynced`; no `AWS_*` keys in any synced Secret |
+| `/v1/models` per key | Each team sees only its own models |
+| `team-turbines` key calling `local-small` | Rejected: model not allowed for the team |
+| 5 rapid requests on the `team-turbines` key | 3 succeeded, then rate-limited; `team-grid` unaffected |
+| `local-small` with `mock_testing_fallbacks` | Served by Gemini |
+| `bedrock-small` while Bedrock is blocked | Served by Gemini through fallback (a real provider outage) |
+| `team-turbines` pod calling the KServe model directly | Timed out (NetworkPolicy); the same pod reaches the gateway |
+| Spend per team | Recorded per team, including the internal price for the self-hosted model |
+| Langfuse | Every request traced, including the failed Bedrock attempt and the fallback |
+| Master key rotated in Secrets Manager | Synced to the cluster within a minute; picked up after a rolling restart |
+ 
+Test manifest: `labs/lab3/probe.yaml`.
+ 
+### Issues hit and how they were fixed
+ 
+- **Bedrock rejected every call with "Operation not allowed".** The same error appeared from an admin principal calling the AWS CLI directly, so it was the account, not the lab. Service Quotas showed the *applied* Nova Micro quotas at **0** (requests per minute, tokens per minute, tokens per day), against defaults of 400, 400,000 and 5.76 billion, in both ap-south-1 and us-east-1. The Bedrock Mantle endpoint also returned "model not available for this account" for GPT-5.6 Luna. A quota increase request and an AWS Support case were opened. Gemini was added as a stand-in, and `bedrock-small` stays configured so it works as soon as AWS lifts the hold.
+- **LiteLLM's migrations job failed: "serviceaccount litellm not found".** The chart runs migrations as an Argo CD PreSync hook, which runs before the chart's regular resources, including the service account the chart was creating. Fixed by creating the service account in `platform/gateway/` (synced by an earlier app) and setting `serviceAccount.create: false` in the chart values.
+- **The hook job hung in `Terminating` after the stuck sync was cancelled.** Argo CD puts a finalizer on hook resources and only removes it when the sync completes. Removed the finalizer by hand and started a fresh sync by patching the Application's `operation` field.
+- **Langfuse showed six "models" for three backends.** LiteLLM reports both the alias the client requested and the provider model that served it. That's expected; see the cost decision above.
+### What changes in production
+ 
+**The gateway itself**
+ 
+- Multiple replicas behind an internal load balancer, with a PodDisruptionBudget, and **Redis** so rate limits and budgets are shared across replicas. Without Redis, each replica enforces its own limits.
+- Autoscaling on requests and tokens per second rather than CPU (the chart supports both through HPA or KEDA), with the replica ceiling sized against database connections.
+- An explicit fail-open or fail-closed decision for when the gateway is down, since it sits in front of every AI app.
+- Managed Postgres (Azure Database for PostgreSQL or RDS/Aurora) with Entra ID or IAM database authentication, backups and a read replica. The chart supports IAM and Entra auth, so there's no database password.
+- A build-or-buy decision: LiteLLM open source or enterprise, Azure API Management's AI gateway features (token limits, semantic caching, load balancing across Azure OpenAI deployments), Envoy AI Gateway, Kong or Portkey.
+**Identity and secrets**
+ 
+- **On EKS,** IRSA or EKS Pod Identity replace the S3-hosted issuer and the hand-written token volume.
+- **On AKS,** the built-in OIDC issuer is registered with AWS IAM the same way, and Entra Workload Identity gives keyless access to Azure OpenAI and Key Vault.
+- **Federation first:** every provider that supports federated identity is called without keys; only SaaS providers that require API keys keep them, and those live in a secret manager with an owner and a rotation schedule.
+- **Automatic restarts on rotation** with a tool such as Stakater Reloader, plus alerts on ExternalSecret sync failures.
+- One SecretStore and IAM role per namespace, created by the same pipeline that onboards the tenant.
+**Tenants, keys and access**
+ 
+- Teams, keys and budgets managed as code (LiteLLM has a Terraform provider), not by API calls.
+- SSO for the admin UI, with team membership mapped from Entra ID groups.
+- Keys per application with expiry and rotation; no shared keys.
+- Budgets that alert at thresholds rather than hard-stopping business-critical workloads, with an agreed escalation path.
+**Network and data protection**
+ 
+- Private connectivity to providers: VPC interface endpoints (PrivateLink) for Bedrock, private endpoints for Azure OpenAI, and an egress allow-list so models are reachable only through the gateway.
+- Guardrails at the gateway: PII redaction, prompt-injection checks and content safety (Bedrock Guardrails, Azure AI Content Safety, or the gateway's own).
+- Routing by data classification and region, so EU data stays on EU endpoints.
+- Prompt and response logging with redaction, retention limits and access controls; in Germany, employee-data rules also apply to who may read logs.
+- **No free-tier SaaS models.** The Gemini free tier allows the provider to use inputs and outputs to improve its models; enterprise traffic goes through paid tiers or cloud-hosted endpoints with data-processing terms.
+**Provider capacity, the lesson from this lab**
+ 
+- New cloud accounts can start with model quotas at **zero**, and raising them takes a support case. Quota and model-access checks belong in account and landing-zone onboarding, not in a project's first week.
+- Request regional quotas ahead of demand, consider provisioned throughput for steady workloads, and keep a tested fallback to a second region or provider.
+**Cost and model lifecycle**
+ 
+- Gateway spend per team feeds finance for chargeback, with internal per-token prices for self-hosted GPU models.
+- Response caching to cut repeat cost.
+- Aliases are versioned. A model change behind an alias is released only after it passes the eval set (Lab 7).
+- Provider deprecations are tracked. Gemini 2.5 was shut down in October 2026, which would have broken any app pinned to it; apps pinned to aliases are protected.
