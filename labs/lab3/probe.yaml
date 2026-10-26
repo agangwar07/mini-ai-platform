@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probe
+  namespace: team-turbines
+spec:
+  containers:
+    - name: curl
+      image: curlimages/curl:8.11.1
+      command: ["sleep", "infinity"]
+      resources: { limits: { cpu: 100m, memory: 64Mi } }
