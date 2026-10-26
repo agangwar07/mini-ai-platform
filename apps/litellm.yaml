@@ -1,0 +1,81 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: litellm
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: ghcr.io/berriai
+    chart: litellm-helm
+    targetRevision: "1.106.4"
+    helm:
+      valuesObject:
+        fullnameOverride: litellm
+        replicaCount: 1
+        serviceAccount:
+          create: true
+          name: litellm
+          annotations:
+            eks.amazonaws.com/role-arn: arn:aws:iam::416338380738:role/mini-ai-litellm-bedrock
+        volumes:
+          - name: aws-iam-token
+            projected:
+              sources:
+                - serviceAccountToken:
+                    audience: sts.amazonaws.com
+                    expirationSeconds: 3600
+                    path: token
+        volumeMounts:
+          - name: aws-iam-token
+            mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount
+            readOnly: true
+        envVars:
+          AWS_ROLE_ARN: arn:aws:iam::416338380738:role/mini-ai-litellm-bedrock
+          AWS_WEB_IDENTITY_TOKEN_FILE: /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+          AWS_REGION: ap-south-1
+          AWS_STS_REGIONAL_ENDPOINTS: regional
+        masterkeySecretName: litellm-masterkey
+        masterkeySecretKey: masterkey
+        db:
+          useExisting: true
+          deployStandalone: false
+          endpoint: postgres.gateway.svc.cluster.local
+          database: litellm
+          secret:
+            name: litellm-db
+            usernameKey: username
+            passwordKey: password
+        environmentSecrets:
+          - litellm-env
+        resources:
+          requests: { cpu: 200m, memory: 512Mi }
+          limits: { memory: 1536Mi }
+        proxy_config:
+          model_list:
+            - model_name: local-small
+              litellm_params:
+                model: openai/qwen
+                api_base: http://qwen-predictor.team-grid.svc.cluster.local/openai/v1
+                api_key: none
+                timeout: 90
+                input_cost_per_token: 0.0000001
+                output_cost_per_token: 0.0000004
+            - model_name: bedrock-small
+              litellm_params:
+                model: bedrock/amazon.nova-micro-v1:0
+                aws_region_name: ap-south-1
+                timeout: 60
+          router_settings:
+            fallbacks:
+              - local-small: [bedrock-small]
+          litellm_settings:
+            callbacks: ["langfuse_otel"]
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gateway
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    retry:
+      limit: 10
+      backoff: { duration: 30s, factor: 2, maxDuration: 5m }
