@@ -64,9 +64,15 @@ spec:
                 model: bedrock/amazon.nova-micro-v1:0
                 aws_region_name: ap-south-1
                 timeout: 60
+            - model_name: gemini-small
+              litellm_params:
+                model: gemini/gemini-3.5-flash-lite
+                api_key: os.environ/GEMINI_API_KEY
+                timeout: 60
           router_settings:
             fallbacks:
-              - local-small: [bedrock-small]
+              - local-small: [gemini-small, bedrock-small]
+              - bedrock-small: [gemini-small]
           litellm_settings:
             callbacks: ["langfuse_otel"]
   destination:
