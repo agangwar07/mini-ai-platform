@@ -182,7 +182,7 @@ Measured cold start for a new replica: _add your measurement_.
 ### What changes in production
  
 - GPU node pools with vLLM as the backend, scaling on vLLM metrics such as running or waiting requests
-- Model weights cached on nodes or in a shared volume (KServe LocalModelCache) to cut cold starts, instead of downloading from Hugging Face on every start
+- Model weights cached on nodes or in a shared volume (KServe LocalModelCache) to cut cold starts, instead of downloading from Hugging Face on every startACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 - Model sources restricted to an internal registry or storage account, not the public Hugging Face Hub
 - Tenant quotas sized from capacity plans and GPU availability, not fixed numbers
  
