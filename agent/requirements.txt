@@ -3,3 +3,8 @@ langchain-mcp-adapters
 langgraph
 langchain-openai
 langfuse
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+opentelemetry-instrumentation-httpx
+opentelemetry-instrumentation-openai-v2==2.4b0
+opentelemetry-util-genai==1.1b0

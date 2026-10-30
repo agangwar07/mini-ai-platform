@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: loadgen
+  namespace: team-grid
+spec:
+  restartPolicy: Never
+  containers:
+    - name: load
+      image: curlimages/curl:8.11.1
+      env:
+        - name: KEY
+          valueFrom: { secretKeyRef: { name: loadgen-key, key: key } }
+        - name: MAX_TOKENS
+          value: "40"
+      resources: { limits: { cpu: 100m, memory: 64Mi } }
+      command: ["sh", "-c"]
+      args:
+        - |
+          i=0
+          while true; do
+            i=$((i+1))
+            MODEL=local-small
+            [ $((i % 5)) -eq 0 ] && MODEL=gemini-small
+            curl -s -N -o /dev/null -w "$MODEL %{http_code} %{time_total}s\n" \
+              http://litellm.gateway:4000/v1/chat/completions \
+              -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+              -d "{\"model\":\"$MODEL\",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"max_tokens\":$MAX_TOKENS,\"messages\":[{\"role\":\"user\",\"content\":\"Name one benefit of wind power.\"}]}"
+            sleep 3
+          done

@@ -1,4 +1,4 @@
-"""Kubernetes ops agent: LangGraph loop + MCP tools + human approval for changes."""
+"""Kubernetes ops agent: LangGraph loop + MCP tools + human approval, with OpenTelemetry tracing."""
 import asyncio, json, os, sys, uuid
 from typing import Literal
 
@@ -11,9 +11,24 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 from langgraph.types import Command, interrupt
 
-WRITE_TOOLS = {"rollout_restart"}          # anything that changes the cluster needs approval
+# OTEL: tracer provider exporting to the Collector; auto-instrument HTTP and the OpenAI SDK.
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from opentelemetry.instrumentation.openai_v2 import OpenAIInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-# CHANGED: tell the model the platform handles approval, so it calls the tool instead of asking in text.
+provider = TracerProvider(resource=Resource.create({"service.name": "k8s-ops-agent"}))
+provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))   # endpoint from OTEL_EXPORTER_OTLP_ENDPOINT
+trace.set_tracer_provider(provider)
+HTTPXClientInstrumentor().instrument()
+OpenAIInstrumentor().instrument()
+tracer = trace.get_tracer("k8s-ops-agent")
+
+WRITE_TOOLS = {"rollout_restart"}
+
 SYSTEM = """You are a Kubernetes operations assistant for an AI platform team.
 Always diagnose with the read-only tools (list_pods, get_events, get_logs) before proposing any change.
 When the evidence shows a restart is likely to help, call rollout_restart directly.
@@ -27,6 +42,7 @@ Finish with: what is wrong, the evidence, and what you did or recommend."""
 async def build_graph():
     mcp = MultiServerMCPClient({"k8s": {"url": os.environ["MCP_URL"], "transport": "streamable_http"}})
     tools = await mcp.get_tools()
+    tool_node = ToolNode(tools)
 
     llm = ChatOpenAI(model="gemini-small", base_url=os.environ["GATEWAY_URL"],
                      api_key=os.environ["AGENT_KEY"], temperature=0, max_tokens=2048, timeout=90)
@@ -35,6 +51,14 @@ async def build_graph():
     async def agent(state: MessagesState):
         reply = await llm_with_tools.ainvoke([SystemMessage(SYSTEM)] + state["messages"])
         return {"messages": [reply]}
+
+    # OTEL: one span per tool execution, named per the GenAI semantic conventions.
+    async def tools(state: MessagesState):
+        names = ",".join(tc["name"] for tc in state["messages"][-1].tool_calls)
+        with tracer.start_as_current_span(f"execute_tool {names}") as span:
+            span.set_attribute("gen_ai.operation.name", "execute_tool")
+            span.set_attribute("gen_ai.tool.name", names)
+            return await tool_node.ainvoke(state)
 
     def route(state: MessagesState) -> Literal["approval", "tools", "__end__"]:
         last = state["messages"][-1]
@@ -57,7 +81,7 @@ async def build_graph():
     graph = StateGraph(MessagesState)
     graph.add_node("agent", agent)
     graph.add_node("approval", approval)
-    graph.add_node("tools", ToolNode(tools))
+    graph.add_node("tools", tools)
     graph.add_edge(START, "agent")
     graph.add_conditional_edges("agent", route, ["approval", "tools", END])
     graph.add_edge("tools", "agent")
@@ -74,7 +98,6 @@ def show_new(messages, seen):
     return len(messages)
 
 
-# CHANGED: one turn of the conversation, including any approval pauses, as its own function.
 async def run_turn(graph, user_input, config, seen):
     result = await graph.ainvoke(user_input, config)
     seen = show_new(result["messages"], seen)
@@ -103,10 +126,15 @@ async def main():
 
     seen = 0
     try:
-        # CHANGED: keep the conversation going, so you can reply ("yes, restart it") in the same thread.
         while question:
             print(f"\nYou: {question}")
-            seen = await run_turn(graph, {"messages": [HumanMessage(question)]}, config, seen)
+            # OTEL: one root span per turn; model calls, tools and gateway spans nest under it.
+            with tracer.start_as_current_span("invoke_agent k8s-ops-agent") as span:
+                span.set_attribute("gen_ai.operation.name", "invoke_agent")
+                span.set_attribute("gen_ai.agent.name", "k8s-ops-agent")
+                span.set_attribute("session.id", thread_id)
+                seen = await run_turn(graph, {"messages": [HumanMessage(question)]}, config, seen)
+                print(f"  (trace id: {format(span.get_span_context().trace_id, '032x')})")
             question = input("\nYou (press Enter to finish): ").strip()
     except GraphRecursionError:
         print("\nStopped: the agent hit its step limit (recursion_limit) without finishing.")
@@ -114,6 +142,7 @@ async def main():
         if callbacks:
             from langfuse import get_client
             get_client().flush()
+        provider.force_flush()   # OTEL: send remaining spans before exit
 
 
 asyncio.run(main())
