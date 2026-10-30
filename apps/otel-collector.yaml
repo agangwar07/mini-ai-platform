@@ -1,0 +1,74 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: otel-collector
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://open-telemetry.github.io/opentelemetry-helm-charts
+    chart: opentelemetry-collector
+    targetRevision: 0.178.1
+    helm:
+      valuesObject:
+        mode: deployment
+        fullnameOverride: otel-collector
+        image:
+          repository: otel/opentelemetry-collector-contrib
+        command:
+          name: otelcol-contrib
+        resources:
+          requests: { cpu: 50m, memory: 128Mi }
+          limits: { memory: 384Mi }
+        ports:
+          jaeger-compact: { enabled: false }
+          jaeger-thrift: { enabled: false }
+          jaeger-grpc: { enabled: false }
+          zipkin: { enabled: false }
+          prom-exporter:
+            enabled: true
+            containerPort: 8889
+            servicePort: 8889
+            protocol: TCP
+        config:
+          receivers:
+            jaeger: null
+            zipkin: null
+            prometheus: null
+          processors:
+            attributes/redact:
+              actions:
+                - { key: gen_ai.input.messages, action: delete }
+                - { key: gen_ai.output.messages, action: delete }
+                - { key: gen_ai.system_instructions, action: delete }
+          connectors:
+            spanmetrics:
+              histogram:
+                explicit:
+                  buckets: [250ms, 500ms, 1s, 2s, 5s, 10s, 20s, 30s, 60s]
+              dimensions:
+                - name: gen_ai.request.model
+          exporters:
+            otlp/tempo:
+              endpoint: tempo.observability.svc.cluster.local:4317
+              tls: { insecure: true }
+            prometheus:
+              endpoint: 0.0.0.0:8889
+              resource_to_telemetry_conversion: { enabled: true }
+          service:
+            pipelines:
+              traces:
+                receivers: [otlp]
+                processors: [memory_limiter, attributes/redact, batch]
+                exporters: [otlp/tempo, spanmetrics]
+              metrics:
+                receivers: [otlp, spanmetrics]
+                processors: [memory_limiter, batch]
+                exporters: [prometheus]
+              logs: null
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true]
