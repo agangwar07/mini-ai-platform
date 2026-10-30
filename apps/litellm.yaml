@@ -38,6 +38,7 @@ spec:
           OTEL_SERVICE_NAME: litellm-gateway
           LITELLM_OTEL_INTEGRATION_ENABLE_METRICS: "true"
           USE_OTEL_LITELLM_REQUEST_SPAN: "true"
+          DEBUG_OTEL: "true"
         masterkeySecretName: litellm-masterkey
         masterkeySecretKey: masterkey
         db:
