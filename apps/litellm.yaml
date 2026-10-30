@@ -33,6 +33,11 @@ spec:
           AWS_WEB_IDENTITY_TOKEN_FILE: /var/run/secrets/eks.amazonaws.com/serviceaccount/token
           AWS_REGION: ap-south-1
           AWS_STS_REGIONAL_ENDPOINTS: regional
+          OTEL_EXPORTER: otlp_http
+          OTEL_ENDPOINT: http://otel-collector.observability.svc.cluster.local:4318
+          OTEL_SERVICE_NAME: litellm-gateway
+          LITELLM_OTEL_INTEGRATION_ENABLE_METRICS: "true"
+          USE_OTEL_LITELLM_REQUEST_SPAN: "true"
         masterkeySecretName: litellm-masterkey
         masterkeySecretKey: masterkey
         db:
@@ -74,7 +79,15 @@ spec:
               - local-small: [gemini-small, bedrock-small]
               - bedrock-small: [gemini-small]
           litellm_settings:
-            callbacks: ["langfuse_otel"]
+            callbacks: ["langfuse_otel", "otel"]
+          callback_settings:
+            otel:
+              attributes:
+                include_list:
+                  - gen_ai.operation.name
+                  - gen_ai.system
+                  - gen_ai.request.model
+                  - metadata.user_api_key_team_alias
   destination:
     server: https://kubernetes.default.svc
     namespace: gateway
