@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-k8s-ops
+  namespace: agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mcp-k8s-ops }
+  template:
+    metadata:
+      labels: { app: mcp-k8s-ops }
+    spec:
+      serviceAccountName: mcp-k8s-ops
+      containers:
+        - name: server
+          image: mcp-k8s-ops:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 8000 }]
+          readinessProbe:
+            tcpSocket: { port: 8000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-k8s-ops
+  namespace: agents
+spec:
+  selector: { app: mcp-k8s-ops }
+  ports: [{ port: 8000, targetPort: 8000 }]

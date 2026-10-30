@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-k8s-ops
+  namespace: agents
+---
+# Read-only, cluster-wide: pods, their logs, and events. No secrets, no configmaps.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mcp-k8s-ops-read
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mcp-k8s-ops-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mcp-k8s-ops-read
+subjects:
+  - kind: ServiceAccount
+    name: mcp-k8s-ops
+    namespace: agents
+---
+# Write access only in team-grid, and only to restart Deployments.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mcp-k8s-ops-restart
+  namespace: team-grid
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mcp-k8s-ops-restart
+  namespace: team-grid
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mcp-k8s-ops-restart
+subjects:
+  - kind: ServiceAccount
+    name: mcp-k8s-ops
+    namespace: agents
