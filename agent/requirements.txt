@@ -1,0 +1,5 @@
+mcp>=1.12,<2
+langchain-mcp-adapters
+langgraph
+langchain-openai
+langfuse
