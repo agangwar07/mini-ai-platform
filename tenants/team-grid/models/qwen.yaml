@@ -10,7 +10,7 @@ spec:
     labels:
       platform.io/workload: inference
     minReplicas: 1
-    maxReplicas: 2
+    maxReplicas: 1
     autoScaling:
       metrics:
         - type: Resource
