@@ -13,7 +13,7 @@ Everything in the cluster is declared in this repo and deployed by Argo CD. The 
 | 3 | LLM gateway, secrets from AWS Secrets Manager, keyless AWS access | Done |
 | 4 | Bedrock RAG with Guardrails | Blocked: AWS has Bedrock quotas at 0 on this account (support case open) |
 | 5 | Kubernetes ops agent over MCP with human approval | Done |
-| 6 | OpenTelemetry for LLM workloads | Planned |
+| 6 | OpenTelemetry for LLM workloads, exported to Grafana Cloud | Done |
 | 7 | Eval-gated canary and governance pack | Planned |
 
 ## How it fits together
@@ -42,6 +42,9 @@ flowchart TD
     Agent[Ops agent, LangGraph<br/>runs in Codespace] -->|agent key| LiteLLM
     Agent -->|MCP streamable HTTP| MCP[MCP server: mcp-k8s-ops<br/>agents namespace]
     MCP -->|scoped service account| K8sAPI[Kubernetes API + RBAC]
+    LiteLLM -->|OTLP| OTel[OpenTelemetry Collector<br/>observability namespace]
+    Agent -->|OTLP| OTel
+    OTel -->|OTLP/HTTPS, redacted| GC[Grafana Cloud<br/>traces, metrics, dashboard, SLO alert]
 ```
 
 ## Repo layout
@@ -54,7 +57,8 @@ platform/policies/      Kyverno ClusterPolicies
 platform/gateway/       Gateway namespace, Postgres, service accounts, SecretStore, ExternalSecrets
 platform/agents/        agents namespace, MCP server Deployment/Service, its service account and RBAC
 mcp/k8s-ops/            MCP server source code and Dockerfile
-agent/                  LangGraph ops agent, a direct MCP test client, and Python requirements
+agent/                  LangGraph ops agent (OpenTelemetry-instrumented), a direct MCP test client, pinned Python requirements
+platform/observability/ Exported Grafana dashboard and alert rule (dashboards and alerts as code)
 scripts/kind-oidc.sh    Turns the kind API server into a public OIDC issuer for AWS federation
 tenants/base/           Shared tenant guardrails: quota, limit range, network policies
 tenants/<team>/         One folder per tenant; adding a folder onboards a tenant
@@ -105,6 +109,17 @@ From Lab 5 onwards, the MCP server image isn't in a registry, so after every clu
 docker build -t mcp-k8s-ops:0.1.0 mcp/k8s-ops
 kind load docker-image mcp-k8s-ops:0.1.0 --name platform
 ```
+
+From Lab 6 onwards, the Collector needs its Grafana Cloud credential as a Secret before it can export (see Lab 6, Part 2):
+
+```bash
+kubectl create namespace observability --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n observability create secret generic grafana-cloud \
+  --from-literal=GRAFANA_CLOUD_OTLP_ENDPOINT="https://otlp-gateway-prod-<region>.grafana.net/otlp" \
+  --from-literal=GRAFANA_CLOUD_AUTH="<base64 of instance-id:token>"
+```
+
+To run the agent, set up port-forwards, a fresh agent key and environment variables in one step: `source .venv-agent/bin/activate && source labs/lab6/agent-env.sh`. Re-run it in every new terminal and after any pod restart.
 
 Argo CD UI: `kubectl port-forward svc/argocd-server -n argocd 8080:80`, user `admin`, password from `argocd admin initial-password -n argocd`.
 
@@ -465,3 +480,115 @@ Test workloads in `labs/lab5/scenarios.yaml` (pinned images and limits, so Lab 1
 - Agent quality measured by task success on a scenario set, not just answer quality.
 - Trace retention and redaction policies for tool results that may contain sensitive data.
 - In an energy company, **agents never get write access to operational technology (OT)**. They read from historian replicas or the IT side of the boundary.
+
+---
+
+## Lab 6: OpenTelemetry for LLM workloads
+
+### What was built
+
+End-to-end tracing and LLM-specific metrics for the platform, with a latency SLO and burn-rate alert. Only the **OpenTelemetry Collector** runs in the cluster (about 100–150 MB); traces, metrics, dashboards and alerting are hosted on **Grafana Cloud's free tier**.
+
+**How telemetry flows:**
+
+1. The **gateway** (LiteLLM) emits a span per request, a `litellm_request` span per model call, and GenAI metrics. It sends them over OTLP/HTTP to the Collector.
+2. The **agent** (Lab 5) emits its own spans, one per turn, model call and tool execution, and puts a W3C `traceparent` header on every outgoing HTTP call. The gateway continues the same trace, so one trace covers agent → gateway → model, and agent → MCP server.
+3. The **Collector** deletes prompt and response text from spans, derives call counts and latency histograms from spans, batches everything, and pushes it to Grafana Cloud over OTLP/HTTPS with Basic auth.
+4. In **Grafana Cloud**: trace search, the **LLM Platform** dashboard, and the SLO burn-rate alert.
+
+**Components:**
+
+| Component | Where | What it contributes |
+| --- | --- | --- |
+| OpenTelemetry Collector (`apps/otel-collector.yaml`) | `observability` namespace | Contrib distribution, deployed by Argo CD. OTLP receivers on all pod interfaces. An `attributes/redact` processor deletes `gen_ai.input.messages`, `gen_ai.output.messages` and `gen_ai.system_instructions`. A `spanmetrics` connector produces call counts and latency histograms (buckets include 5 s for the SLO), labelled by model. A memory limiter, and an `otlphttp` exporter to Grafana Cloud |
+| Secret `observability/grafana-cloud` | Cluster | OTLP endpoint and `base64(instance-id:token)` credential, injected into the Collector as environment variables and referenced as `${env:...}` in its config, so they never appear in Git |
+| LiteLLM `otel` callback | `gateway` namespace | Runs alongside the Langfuse callback. Environment: `OTEL_EXPORTER=otlp_http`, `OTEL_ENDPOINT` (the Collector), `OTEL_SERVICE_NAME=litellm-gateway`, `LITELLM_OTEL_INTEGRATION_ENABLE_METRICS=true`, `USE_OTEL_LITELLM_REQUEST_SPAN=true`. Metric labels limited to operation, provider, model and team, to control cardinality |
+| Agent instrumentation (`agent/agent.py`) | Codespace | OpenTelemetry SDK with an OTLP/HTTP exporter; HTTPX instrumentation (spans and `traceparent`); OpenAI-SDK GenAI instrumentation (`chat <model>` spans). Manual `invoke_agent` and `execute_tool` spans named per the GenAI semantic conventions |
+| `labs/lab6/agent-env.sh` | Codespace | Restarts the gateway, MCP and Collector port-forwards, issues a fresh agent key, exports environment variables, and checks each link |
+| Load generators (`labs/lab6/loadgen*.yaml`) | `team-grid` | Steady streaming traffic (mostly `local-small`, every fifth request to Gemini to protect the free quota), and a heavy burst of long `local-small` requests |
+
+**Signals now available:**
+
+- **Gateway GenAI metrics:** time to first token (`gen_ai.server.time_to_first_token`), time per output token, operation duration, token usage and cost, by model and team
+- **Span metrics:** call rate, error rate and latency for every span, including each model call (`litellm_request`)
+- **Traces:** the full path of an agent run, including the gateway's internal spans for each model call
+
+### Dashboard and SLO
+
+**LLM Platform dashboard** (exported to `platform/observability/dashboards/`):
+
+- time to first token p95 by model
+- output tokens per second by model
+- requests per second by team and model
+- model-call latency p95 from span metrics
+- model calls by status
+
+**SLO:** 95% of model calls through the gateway complete within 5 seconds. The alert rule `LLMGatewayLatencyBudgetBurn` (Grafana-managed alerting):
+
+| Part | Definition |
+| --- | --- |
+| SLI | Share of `litellm_request` spans slower than 5 s: `1 - (calls with le="5000" ÷ all calls)` |
+| Windows | 2 minutes and 10 minutes, both required |
+| Threshold | Above 0.3 in both windows: a burn rate of 6 against a 5% error budget |
+| Pending period | 1 minute |
+| Routing | Default contact point (email), label `severity=page` |
+
+Production windows would be 5m/1h at 14.4× plus 30m/6h at 6× against a 30-day SLO. They were compressed so the alert fires within minutes.
+
+### Verification
+
+| Test | Result |
+| --- | --- |
+| Collector self-metrics after test traffic | `otelcol_receiver_accepted_spans` and `otelcol_exporter_sent_spans` / `sent_metric_points` above zero, no send failures |
+| Gateway traces in Grafana Cloud | `Received Proxy Server Request` with a `litellm_request` child carrying `gen_ai.*` attributes, and no message content (redacted) |
+| GenAI and span metrics | `gen_ai_*` and `traces_span_metrics_*` series available in Grafana Cloud's Prometheus data source |
+| Agent run (crash-loop scenario) | Correct diagnosis (missing ConfigMap, no restart proposed). One trace containing the agent's turn, its tool executions, and the gateway's spans for each model call |
+| Langfuse | Still receives every gateway request with content, alongside the OpenTelemetry export |
+| Noisy-neighbour burst | Model-call p95 rose above 5 s, and the burn-rate alert went Pending, then Firing; it recovered after the burst was stopped |
+
+### Design decisions
+
+- **One Collector as the only telemetry exit.** Apps send OTLP to the Collector and never to a vendor. Moving from an in-cluster backend to Grafana Cloud changed only the Collector's exporter; no app changed.
+- **Redaction before data leaves the cluster.** Prompt and response text are removed in the Collector, so the SaaS backend never receives them. Langfuse, fed by its own callback, keeps content for debugging. In production that's a per-destination decision.
+- **Metric cardinality controlled at the source.** The gateway stamps only operation, provider, model and team onto metrics; spans keep full detail. On a hosted backend, every label combination is a billable series.
+- **The SLO is defined on what users experience** (model-call latency from traces), not on CPU, which only says "busy".
+- **Span metrics derived in the Collector,** so latency and error metrics exist for any instrumented service without each one publishing its own.
+
+### Issues hit and how they were fixed
+
+- **The in-cluster Prometheus, Grafana, Alertmanager and Tempo stack ran the Codespace out of memory.** It was removed from Git first (so Argo CD couldn't reinstall it), then its namespaces, webhooks and CRDs were deleted. The redesign kept only the Collector in-cluster and moved storage, dashboards and alerting to Grafana Cloud. The `qwen` model was also capped at one replica to leave headroom.
+- **Cluster DNS stopped working after the kind node containers were restarted.** Every service lookup to `10.96.0.10` timed out, which made Argo CD show `Unknown`, External Secrets fail, and LiteLLM crash-loop. Fixed by restarting kindnet, then kube-proxy, then CoreDNS, in that order, and then forcing an External Secrets sync and a LiteLLM restart.
+- **Grafana Cloud rejected exports with 401.** The original credential was wrong. The working value came from the `OTEL_EXPORTER_OTLP_HEADERS` shown on the OpenTelemetry (OTLP) connection page: the `glc_` token and the instance ID together, already Base64-encoded. It was tested directly with `curl` before going into the Secret.
+- **One fix attempt saved an empty endpoint into the Secret** (curl showed `HTTP 000`). The endpoint was set explicitly, read back from the Secret, and only then was the Collector restarted.
+- **`kubectl port-forward` to the Collector exited on first use.** The Helm chart binds OTLP receivers to the pod IP only, and port-forward connects to the pod's localhost. Fixed by setting the receivers to `0.0.0.0` in Git.
+- **Port-forwards died whenever the target pod restarted,** because a port-forward is tied to the pod it started with. Handled by `agent-env.sh`, which recreates them and checks each link.
+- **The agent's OpenAI instrumentation failed to import** (`No module named 'opentelemetry.util.genai.instruments'`). `opentelemetry-instrumentation-openai-v2` declared only a lower bound on `opentelemetry-util-genai`, so pip installed a newer helper that had dropped the module, while `pip check` still reported no problems. Fixed by finding the newest compatible helper version and pinning both packages in `agent/requirements.txt`.
+- **Key creation failed twice:** once because a key alias was reused (aliases must be unique; they're now timestamped), and once because two teams shared the alias `platform-ops-agents`, which put two IDs into the request body (the script now takes the first).
+
+### What changes in production
+
+**Collector topology**
+
+- A gateway tier of several Collector replicas behind a Service, plus a DaemonSet agent per node where node-level data (logs, kubelet metrics) is needed.
+- `memory_limiter`, sending queues and retry settings tuned for backend outages, so telemetry is buffered rather than dropped.
+- Tail-based sampling at the gateway tier: keep all error and slow traces and a sample of the rest, to control cost.
+- Collector configuration and version upgrades go through the same GitOps flow, with the Collector's own metrics (accepted, sent and failed) alerted on.
+
+**Backends and data**
+
+- Export to the organisation's existing backend (Dynatrace, Azure Monitor/Application Insights, CloudWatch, Datadog, or self-hosted Mimir and Tempo). With the Collector in place, that's an exporter change.
+- Data residency: EU telemetry goes to EU backend regions, and the Collector is the place to route by data classification.
+- Redaction policy agreed per destination: none of the prompt content in the APM backend, and content only in an access-controlled LLM-tracing tool with retention limits.
+- The backend credential comes from a secret manager via External Secrets (as in Lab 3), or from workload identity where the backend supports it.
+
+**SLOs and alerting**
+
+- SLOs per tier: platform-owned (gateway availability, time to first token, model-call latency) and tenant-owned (quality scores on their use case).
+- Standard multi-window burn rates against a 30-day window. Alerts route to the owning team's on-call through PagerDuty, Teams or Slack, with runbooks linked from each alert.
+- Dashboards and alert rules provisioned as code (Grafana provisioning, Terraform or the Grafana operator), not edited by hand.
+
+**Capacity, the lesson from this lab**
+
+- Observability backends are workloads with real resource needs. Size them up front, or use a managed backend, instead of fitting them into whatever is left on the cluster.
+- A noisy neighbour on a shared model shows up first in latency SLOs, not in CPU graphs. The fixes are per-team rate limits at the gateway (Lab 3), capacity for scale-out, and priority for interactive over batch traffic.
+- Pin exact versions of instrumentation libraries, especially pre-release GenAI ones, and test upgrades deliberately.
