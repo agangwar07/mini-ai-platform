@@ -1,0 +1,71 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: otel-collector
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://open-telemetry.github.io/opentelemetry-helm-charts
+    chart: opentelemetry-collector
+    targetRevision: 0.178.1
+    helm:
+      valuesObject:
+        mode: deployment
+        fullnameOverride: otel-collector
+        image:
+          repository: otel/opentelemetry-collector-contrib
+        command:
+          name: otelcol-contrib
+        extraEnvsFrom:
+          - secretRef:
+              name: grafana-cloud
+        resources:
+          requests: { cpu: 50m, memory: 96Mi }
+          limits: { memory: 256Mi }
+        ports:
+          jaeger-compact: { enabled: false }
+          jaeger-thrift: { enabled: false }
+          jaeger-grpc: { enabled: false }
+          zipkin: { enabled: false }
+        config:
+          receivers:
+            jaeger: null
+            zipkin: null
+            prometheus: null
+          processors:
+            attributes/redact:
+              actions:
+                - { key: gen_ai.input.messages, action: delete }
+                - { key: gen_ai.output.messages, action: delete }
+                - { key: gen_ai.system_instructions, action: delete }
+          connectors:
+            spanmetrics:
+              histogram:
+                explicit:
+                  buckets: [250ms, 500ms, 1s, 2s, 5s, 10s, 20s, 30s, 60s]
+              dimensions:
+                - name: gen_ai.request.model
+          exporters:
+            otlphttp/grafana_cloud:
+              endpoint: ${env:GRAFANA_CLOUD_OTLP_ENDPOINT}
+              headers:
+                authorization: "Basic ${env:GRAFANA_CLOUD_AUTH}"
+              compression: gzip
+          service:
+            pipelines:
+              traces:
+                receivers: [otlp]
+                processors: [memory_limiter, attributes/redact, batch]
+                exporters: [otlphttp/grafana_cloud, spanmetrics]
+              metrics:
+                receivers: [otlp, spanmetrics]
+                processors: [memory_limiter, batch]
+                exporters: [otlphttp/grafana_cloud]
+              logs: null
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: observability
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true]
