@@ -11,7 +11,7 @@ Everything in the cluster is declared in this repo and deployed by Argo CD. The 
 | 1 | GitOps multi-tenant cluster | Done |
 | 2 | Model serving with KServe and KEDA | Done |
 | 3 | LLM gateway, secrets from AWS Secrets Manager, keyless AWS access | Done |
-| 4 | Bedrock RAG with Guardrails | Blocked: AWS has Bedrock quotas at 0 on this account (support case open) |
+| 4 | Bedrock RAG (Knowledge Base on S3 Vectors) and Guardrails, via Terraform | 
 | 5 | Kubernetes ops agent over MCP with human approval | Done |
 | 6 | OpenTelemetry for LLM workloads, exported to Grafana Cloud | Done |
 | 7 | Eval-gated canary, model admission control, governance pack | Done |
@@ -62,6 +62,9 @@ mcp/k8s-ops/            MCP server source code and Dockerfile
 agent/                  LangGraph ops agent (OpenTelemetry-instrumented), a direct MCP test client, pinned Python requirements
 platform/observability/ Exported Grafana dashboard and alert rule (dashboards and alerts as code)
 platform/evals/         Golden set and eval runner, packaged as the gateway-evals ConfigMap
+infra/aws/rag/          Terraform: Bedrock Knowledge Base on S3 Vectors, Guardrail, IAM (S3 remote state)
+labs/lab4/              Source documents for the knowledge base and RAG eval cases
+docs/aws-azure-ai-map.md  AWS-to-Azure equivalents for every platform capability
 governance/             Change process, model cards and the EU AI Act risk assessment
 scripts/kind-oidc.sh    Turns the kind API server into a public OIDC issuer for AWS federation
 tenants/base/           Shared tenant guardrails: quota, limit range, network policies
@@ -385,6 +388,99 @@ Test manifest: `labs/lab3/probe.yaml`.
 - Response caching to cut repeat cost.
 - Aliases are versioned. A model change behind an alias is released only after it passes the eval set (Lab 7).
 - Provider deprecations are tracked. Gemini 2.5 was shut down in October 2026, which would have broken any app pinned to it; apps pinned to aliases are protected.
+
+---
+
+## Lab 4: Bedrock RAG and Guardrails, with Terraform
+
+> **Status:** the Terraform, documents, gateway configuration and eval cases are in this repo. Applying them needs working Bedrock quotas for Amazon Nova Micro and Titan Text Embeddings V2. On this account AWS held the applied quotas at 0, and the support case was closed without raising them (see Lab 3). The verification section below is the test plan to run once quota is available.
+
+### What was built
+
+Managed retrieval-augmented generation (RAG) on AWS, exposed to every tenant through the existing gateway, with a Bedrock Guardrail in front of the model.
+
+**Ingestion flow:**
+
+1. Terraform creates the document bucket, an S3 Vectors bucket and index, the Knowledge Base with an S3 data source, the Guardrail, and the IAM roles.
+2. Documents in `labs/lab4/docs/` are synced to the document bucket, and an ingestion job is started.
+3. Bedrock reads the documents, splits them into 300-token chunks with 20% overlap, embeds each chunk with **Titan Text Embeddings V2** (1024 dimensions), and stores the vectors with their text in the **S3 Vectors** index.
+
+**Query flow, through the gateway:**
+
+1. An app calls the gateway with model `bedrock-small`, a `file_search` tool pointing at the Knowledge Base, and the `energy-guardrail` guardrail.
+2. LiteLLM applies the Bedrock Guardrail to the input (PII masked, prompt attacks and denied topics blocked).
+3. LiteLLM calls Bedrock **Retrieve**; Bedrock embeds the question and returns the closest chunks with their source documents.
+4. LiteLLM adds the chunks to the prompt and calls **Nova Micro**.
+5. Everything runs under the gateway's existing web-identity role from Lab 3, extended with least-privilege permissions. No new credentials.
+
+**Components:**
+
+| Component | Where | What it contributes |
+| --- | --- | --- |
+| Terraform (`infra/aws/rag/`) | Codespace, state in S3 | AWS provider 6.x; S3 backend with native lockfile locking (`use_lockfile`) in a versioned, private state bucket; `default_tags` for cost and ownership attribution |
+| Document bucket | S3 | Source of truth for the Knowledge Base; private, mirrors `labs/lab4/docs/` via `aws s3 sync --delete` |
+| S3 Vectors bucket and index | S3 Vectors | 1024 dimensions, cosine distance; `AMAZON_BEDROCK_TEXT` and `AMAZON_BEDROCK_METADATA` declared non-filterable, as recommended for Knowledge Bases |
+| Knowledge Base service role | IAM | Trusted only by `bedrock.amazonaws.com` for this account (`aws:SourceAccount`, against the confused-deputy problem); may read this bucket, invoke the embedding model, and read and write this index |
+| Knowledge Base + data source | Bedrock | `VECTOR` type with Titan V2; `S3_VECTORS` storage; fixed-size chunking (300 tokens, 20% overlap) |
+| Guardrail + version 1 | Bedrock | Prompt-attack filter (input, high), misconduct filter; email and phone anonymised, passwords blocked; denied topics `ot-control-changes` and `competitor-pricing`, each with a definition and examples; an immutable published version used by apps |
+| Gateway role policy | IAM (Terraform) | Inline policy on `mini-ai-litellm-bedrock`: `bedrock:Retrieve` on this Knowledge Base and `bedrock:ApplyGuardrail` on this guardrail only |
+| LiteLLM `vector_store_registry` | `apps/litellm.yaml` | Registers the Knowledge Base as `energy-docs` (provider `bedrock`), usable by any team through an OpenAI-style `file_search` tool |
+| LiteLLM `guardrails` | `apps/litellm.yaml` | Registers the Bedrock guardrail as `energy-guardrail`, `pre_call` mode with `mask_request_content`, so masked PII never reaches the model |
+| Source documents (`labs/lab4/docs/`) | Git | A turbine maintenance standard, a grid-frequency procedure and substation safety rules, with specific facts (8,000 EOH, 630 °C, 49.5 Hz, category B) a model couldn't know, and a contact email and phone number for PII masking |
+| RAG eval cases (`labs/lab4/rag_golden.jsonl`) | Git | Six cases answerable only from the documents, including one where the correct answer is "not documented" (a hallucination check); run by the Lab 7 runner, which now adds a `file_search` tool for cases marked `"rag": true` |
+| AWS-Azure map (`docs/aws-azure-ai-map.md`) | Git | Equivalents for models, managed RAG, vector storage, embeddings, guardrails, agents runtime, identity, private access, secrets and quotas |
+
+### Design decisions
+
+- **Managed RAG (Knowledge Bases) for standard document Q&A.** Chunking, embedding, indexing and citations come built in. Self-built retrieval (Azure AI Search or pgvector, as at Globant) stays the choice when you need custom chunking, hybrid search tuning or reranking control.
+- **S3 Vectors as the vector store:** serverless, with no cluster to run and a low cost for modest volumes. OpenSearch Serverless or Aurora pgvector are the alternatives when you need hybrid keyword search or very low latency.
+- **One Knowledge Base, exposed through the gateway.** Teams use the same API, keys, limits, spend tracking and traces as for plain model calls, and access is granted by the gateway role's narrow IAM policy.
+- **Guardrails both at the gateway and on RetrieveAndGenerate.** The same versioned guardrail protects the managed RAG path and every gateway request. A published version, not `DRAFT`, makes policy changes deliberate and auditable.
+- **Domain-specific denied topics.** For an energy company, requests to control operational technology are refused before any model sees them.
+- **Grounding is tested, not assumed.** RAG eval cases use facts that exist only in the documents, plus a case whose correct answer is "not documented".
+- **Terraform with remote state, a saved plan, and tagging,** the same practices as the Terraform module library at Globant.
+
+### Verification (test plan, once quota is available)
+
+| Test | Expected result |
+| --- | --- |
+| `terraform plan` / `apply` | About 12 resources created; outputs: bucket, Knowledge Base ID and ARN, data source ID, guardrail ID and version |
+| Ingestion job | `COMPLETE`, 3 documents indexed, 0 failed |
+| `retrieve` for "borescope interval on T-17" | Top chunk from `turbine-t17-maintenance.md`, mentioning 8,000 EOH |
+| `retrieve-and-generate`: trip temperature | "630 °C, borescope inspection before restart", citing the turbine document |
+| `retrieve-and-generate`: "who do I contact" | Answer with the email and phone masked; guardrail `INTERVENED` |
+| `retrieve-and-generate`: "bypass the overspeed trip" | Blocked by the `ot-control-changes` topic |
+| `apply-guardrail` on email, prompt attack, competitor pricing, normal question | Intervened, intervened, intervened, `NONE` |
+| Gateway: `bedrock-small` with `file_search` and `energy-guardrail` | Correct answers from the documents (25,000 EOH, category B); phone number masked before the model; OT-control request returns HTTP 400 "Violated guardrail policy" |
+| RAG eval cases | At least 5/6 pass; `rag-unknown` passes only if the model admits the fact isn't documented |
+| Lab 7 eval gate | Runs before the gateway config sync, as for any `litellm` change |
+
+### Issues hit
+
+- **Bedrock runtime quotas held at 0.** Applied quotas for Nova Micro were 0 against defaults of 400 requests and 400,000 tokens per minute, in both ap-south-1 and us-east-1. Bedrock Mantle returned "model not available for this account". The support case was closed without a quota change. The lab was therefore completed as code with a test plan, and the gateway kept serving users through its Gemini fallback (Lab 3).
+
+### What changes in production
+
+**Data and ingestion**
+
+- Sources such as SharePoint, Confluence and S3 synced by a pipeline, with incremental updates, deletions honoured, and lineage from answer to source document version.
+- **Document-level access control:** users retrieve only what they're allowed to read, via metadata filters or Bedrock's user context, mapped to Entra ID or IAM Identity Center groups. This is the hardest enterprise RAG problem.
+- Chunking tuned per document type (hierarchical or semantic chunking for long manuals), and parsing for tables and PDFs.
+- Separate knowledge bases per data domain or classification, rather than one shared index.
+
+**Security and network**
+
+- Bedrock, S3 and S3 Vectors reached through VPC interface endpoints (PrivateLink); no public traffic.
+- Customer-managed KMS keys on the document bucket, the vector bucket and the state bucket.
+- Guardrail policies owned by security and compliance, versioned and promoted through environments like code; contextual-grounding checks on high-stakes answers.
+- Knowledge Bases and guardrails in a central AI account, shared to workload accounts through cross-account roles.
+
+**Quality and operations**
+
+- RAG evals in the Lab 7 gate on every change to the model, prompt, chunking or document set, scored for faithfulness, answer relevance and context precision (RAGAS-style), not just keywords.
+- Retrieval quality monitored in production: similarity scores, "no answer" rates and user feedback.
+- Model and embedding quotas requested as part of account onboarding, with a second region or provider as tested fallback. This lab is the example of what happens when that step is missed.
+- Re-embedding plans for embedding-model upgrades, since vectors from different models aren't comparable.
 
 ---
 
