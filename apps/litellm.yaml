@@ -53,8 +53,8 @@ spec:
         environmentSecrets:
           - litellm-env
         resources:
-          requests: { cpu: 200m, memory: 512Mi }
-          limits: { memory: 1536Mi }
+          requests: {cpu: 200m, memory: 512Mi}
+          limits: {memory: 1536Mi}
         proxy_config:
           model_list:
             - model_name: local-small
@@ -75,6 +75,19 @@ spec:
                 model: gemini/gemini-3.5-flash-lite
                 api_key: os.environ/GEMINI_API_KEY
                 timeout: 60
+            - model_name: gemini-lite-v2
+              litellm_params:
+                model: gemini/gemini-3.1-flash-lite
+                api_key: os.environ/GEMINI_API_KEY
+                timeout: 60
+            - model_name: grid-assistant
+              litellm_params:
+                model: gemini/gemini-3.5-flash-lite
+                api_key: os.environ/GEMINI_API_KEY
+                timeout: 60
+                weight: 1
+              model_info:
+                id: grid-assistant-stable
           router_settings:
             fallbacks:
               - local-small: [gemini-small, bedrock-small]
@@ -89,11 +102,59 @@ spec:
                   - gen_ai.system
                   - gen_ai.request.model
                   - metadata.user_api_key_team_alias
+        extraResources:
+          - apiVersion: batch/v1
+            kind: Job
+            metadata:
+              name: gateway-eval-gate
+              annotations:
+                argocd.argoproj.io/hook: PreSync
+                argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+                argocd.argoproj.io/sync-wave: "-5"
+            spec:
+              backoffLimit: 0
+              activeDeadlineSeconds: 900
+              template:
+                spec:
+                  restartPolicy: Never
+                  containers:
+                    - name: evals
+                      image: python:3.12-slim
+                      command:
+                        - python
+                        - /evals/run_evals.py
+                      env:
+                        - name: CANDIDATE_MODEL
+                          value: none
+                        - name: PASS_THRESHOLD
+                          value: "0.9"
+                        - name: GATEWAY_URL
+                          value: http://litellm.gateway.svc.cluster.local:4000/v1
+                        - name: GOLDEN_SET
+                          value: /evals/golden.jsonl
+                        - name: EVAL_KEY
+                          valueFrom:
+                            secretKeyRef:
+                              name: eval-runner-key
+                              key: key
+                      volumeMounts:
+                        - name: evals
+                          mountPath: /evals
+                      resources:
+                        requests:
+                          cpu: 50m
+                          memory: 64Mi
+                        limits:
+                          memory: 128Mi
+                  volumes:
+                    - name: evals
+                      configMap:
+                        name: gateway-evals
   destination:
     server: https://kubernetes.default.svc
     namespace: gateway
   syncPolicy:
-    automated: { prune: true, selfHeal: true }
+    automated: {prune: true, selfHeal: true}
     retry:
       limit: 10
-      backoff: { duration: 30s, factor: 2, maxDuration: 5m }
+      backoff: {duration: 30s, factor: 2, maxDuration: 5m}
