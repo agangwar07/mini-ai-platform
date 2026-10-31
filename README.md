@@ -11,7 +11,7 @@ Everything in the cluster is declared in this repo and deployed by Argo CD. The 
 | 1 | GitOps multi-tenant cluster | Done |
 | 2 | Model serving with KServe and KEDA | Done |
 | 3 | LLM gateway, secrets from AWS Secrets Manager, keyless AWS access | Done |
-| 4 | Bedrock RAG (Knowledge Base on S3 Vectors) and Guardrails, via Terraform | 
+| 4 | Bedrock RAG (Knowledge Base on S3 Vectors) and Guardrails, via Terraform | Done |
 | 5 | Kubernetes ops agent over MCP with human approval | Done |
 | 6 | OpenTelemetry for LLM workloads, exported to Grafana Cloud | Done |
 | 7 | Eval-gated canary, model admission control, governance pack | Done |
