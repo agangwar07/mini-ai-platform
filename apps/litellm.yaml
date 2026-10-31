@@ -121,7 +121,7 @@ spec:
                 argocd.argoproj.io/sync-wave: "-5"
             spec:
               backoffLimit: 0
-              activeDeadlineSeconds: 900
+              activeDeadlineSeconds: 1800
               template:
                 spec:
                   restartPolicy: Never
