@@ -5,6 +5,8 @@ metadata:
   annotations:
     serving.kserve.io/deploymentMode: Standard
     serving.kserve.io/autoscalerClass: keda
+  labels:
+    ai.governance/approved: "true"
 spec:
   predictor:
     labels:

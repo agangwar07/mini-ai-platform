@@ -1,0 +1,40 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-approved-models
+spec:
+  background: false
+  rules:
+    - name: model-must-be-approved
+      match:
+        any:
+          - resources:
+              kinds: ["serving.kserve.io/v1beta1/InferenceService"]
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.io/tenant
+                    operator: Exists
+      validate:
+        failureAction: Enforce
+        message: "Models need governance approval: label ai.governance/approved=\"true\" (see governance/)."
+        pattern:
+          metadata:
+            labels:
+              ai.governance/approved: "true"
+    - name: weights-from-approved-sources
+      match:
+        any:
+          - resources:
+              kinds: ["serving.kserve.io/v1beta1/InferenceService"]
+              namespaceSelector:
+                matchExpressions:
+                  - key: platform.io/tenant
+                    operator: Exists
+      validate:
+        failureAction: Enforce
+        message: "Model weights must come from an approved source (hf://Qwen/*)."
+        pattern:
+          spec:
+            predictor:
+              model:
+                storageUri: "hf://Qwen/*"
