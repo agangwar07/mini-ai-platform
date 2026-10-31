@@ -1,0 +1,11 @@
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: shadow-model
+  namespace: team-grid
+spec:
+  predictor:
+    model:
+      modelFormat: { name: huggingface }
+      storageUri: hf://someone/random-model
+      resources: { limits: { cpu: "1", memory: 2Gi } }
