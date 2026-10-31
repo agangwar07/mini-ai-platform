@@ -14,7 +14,7 @@ Everything in the cluster is declared in this repo and deployed by Argo CD. The 
 | 4 | Bedrock RAG with Guardrails | Blocked: AWS has Bedrock quotas at 0 on this account (support case open) |
 | 5 | Kubernetes ops agent over MCP with human approval | Done |
 | 6 | OpenTelemetry for LLM workloads, exported to Grafana Cloud | Done |
-| 7 | Eval-gated canary and governance pack | Planned |
+| 7 | Eval-gated canary, model admission control, governance pack | Done |
 
 ## How it fits together
 
@@ -45,6 +45,8 @@ flowchart TD
     LiteLLM -->|OTLP| OTel[OpenTelemetry Collector<br/>observability namespace]
     Agent -->|OTLP| OTel
     OTel -->|OTLP/HTTPS, redacted| GC[Grafana Cloud<br/>traces, metrics, dashboard, SLO alert]
+    Gate[Eval gate Job<br/>Argo CD PreSync hook] -->|golden set vs candidate| LiteLLM
+    Gate -.->|fail = sync blocked| Root
 ```
 
 ## Repo layout
@@ -59,6 +61,8 @@ platform/agents/        agents namespace, MCP server Deployment/Service, its ser
 mcp/k8s-ops/            MCP server source code and Dockerfile
 agent/                  LangGraph ops agent (OpenTelemetry-instrumented), a direct MCP test client, pinned Python requirements
 platform/observability/ Exported Grafana dashboard and alert rule (dashboards and alerts as code)
+platform/evals/         Golden set and eval runner, packaged as the gateway-evals ConfigMap
+governance/             Change process, model cards and the EU AI Act risk assessment
 scripts/kind-oidc.sh    Turns the kind API server into a public OIDC issuer for AWS federation
 tenants/base/           Shared tenant guardrails: quota, limit range, network policies
 tenants/<team>/         One folder per tenant; adding a folder onboards a tenant
@@ -118,6 +122,8 @@ kubectl -n observability create secret generic grafana-cloud \
   --from-literal=GRAFANA_CLOUD_OTLP_ENDPOINT="https://otlp-gateway-prod-<region>.grafana.net/otlp" \
   --from-literal=GRAFANA_CLOUD_AUTH="<base64 of instance-id:token>"
 ```
+
+From Lab 7 onwards, the eval gate needs its gateway key as a Secret (`kubectl -n gateway create secret generic eval-runner-key --from-literal=key=<platform-evals key>`), and the canary helper needs `yq` (`sudo curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 && sudo chmod +x /usr/local/bin/yq`).
 
 To run the agent, set up port-forwards, a fresh agent key and environment variables in one step: `source .venv-agent/bin/activate && source labs/lab6/agent-env.sh`. Re-run it in every new terminal and after any pod restart.
 
@@ -592,3 +598,101 @@ Production windows would be 5m/1h at 14.4× plus 30m/6h at 6× against a 30-day 
 - Observability backends are workloads with real resource needs. Size them up front, or use a managed backend, instead of fitting them into whatever is left on the cluster.
 - A noisy neighbour on a shared model shows up first in latency SLOs, not in CPU graphs. The fixes are per-team rate limits at the gateway (Lab 3), capacity for scale-out, and priority for interactive over batch traffic.
 - Pin exact versions of instrumentation libraries, especially pre-release GenAI ones, and test upgrades deliberately.
+
+---
+
+## Lab 7: Eval-gated canary, model admission control and governance
+
+### What was built
+
+A release process for AI changes: **no model change reaches users without passing evals**, changes roll out as a canary behind a stable alias, only approved models can be deployed, and every AI component has governance documentation.
+
+**How a model change flows:**
+
+1. A change to the `grid-assistant` alias (candidate model and canary weights) is made with `labs/lab7/set-canary.sh` and pushed.
+2. Argo CD syncs the `litellm` app. Before applying anything, it runs the **eval gate**: a Kubernetes Job declared as an Argo CD **PreSync hook**.
+3. The Job sends the **golden set** to the **candidate model** through the gateway, using its own key, and checks every answer.
+4. **Pass:** the sync continues, and LiteLLM sends a weighted share of `grid-assistant` traffic to the candidate. **Fail or inconclusive:** the Job exits non-zero, the sync fails, and routing does not change.
+5. The canary is watched on the Lab 6 dashboard (broken down by model), then promoted by another change, which runs the gate again.
+6. Separately, **Kyverno** rejects InferenceServices that lack governance approval or load weights from unapproved sources.
+
+**Components:**
+
+| Component | Where | What it contributes |
+| --- | --- | --- |
+| Golden set (`platform/evals/golden.jsonl`) | Git | 12 cases: domain facts, energy maths and unit conversion, JSON output, German translation, safety advice, two refusals (bypassing turbine interlocks, operators' personal data), and a prompt-injection case |
+| Eval runner (`platform/evals/run_evals.py`) | Git → ConfigMap | Standard-library Python. Calls the candidate through the gateway; retries transient errors (408/429/5xx/timeouts) with 5/15/30 s backoff; classifies each case as PASS, FAIL or ERROR; verdict PASS, BLOCK or INCONCLUSIVE; non-zero exit blocks |
+| `evals` Argo CD app (`platform/evals/kustomization.yaml`) | `gateway` namespace | Kustomize `configMapGenerator` turns the runner and golden set into the `gateway-evals` ConfigMap (hash suffix disabled so the Job can mount it by name) |
+| Eval gate Job (`extraResources` in `apps/litellm.yaml`) | `gateway` namespace | `argocd.argoproj.io/hook: PreSync`, sync wave -5, `BeforeHookCreation` delete policy (the last run stays for its logs), `backoffLimit: 0`, 30-minute deadline. Runs on `python:3.12-slim`; settings from env vars (`CANDIDATE_MODEL`, `PASS_THRESHOLD=0.9`, gateway URL, golden-set path) and the key from Secret `eval-runner-key` |
+| `platform-evals` team and key | LiteLLM | Eval traffic separated in spend and traces; allowed models: `local-small`, `gemini-small`, `gemini-lite-v2`, `grid-assistant` |
+| `grid-assistant` alias | LiteLLM config | One alias with weighted deployments: `grid-assistant-stable` and `grid-assistant-canary` (`model_info.id`), split by `weight`; the serving deployment is returned in the `x-litellm-model-id` response header |
+| `gemini-lite-v2` | LiteLLM config | The candidate (a different Gemini Flash-Lite release), registered as its own alias so it can be evaluated before receiving any traffic |
+| `labs/lab7/set-canary.sh` | Codespace | Uses `yq` to replace the canary deployment (copying the candidate's backend settings), set both weights, and point the gate's `CANDIDATE_MODEL` at the candidate, all in one edit |
+| Kyverno policy `require-approved-models` | Cluster | For InferenceServices in tenant namespaces: requires label `ai.governance/approved: "true"` and `storageUri` matching `hf://Qwen/*`; admission-time only (`background: false`) |
+| `governance/` | Git | `README.md` (five-step change process), model cards for `grid-assistant` and `k8s-ops-agent`, and the EU AI Act risk assessment for the agent |
+
+### Gate design
+
+| Outcome | Meaning | Gate result |
+| --- | --- | --- |
+| PASS | The model answered and every check passed | Counts toward quality |
+| FAIL | The model answered but failed a check (wrong fact, invalid JSON, no refusal, obeyed the injection) | Counts against quality |
+| ERROR | No answer after retries (provider overload, timeout, missing permission) | Counts toward the error limit, not quality |
+
+- **Quality** = passes ÷ answered cases. Below 90% → **BLOCK**.
+- **More than one ERROR → INCONCLUSIVE.** Still blocks, but signals "re-run later", not "the model got worse".
+- **`CANDIDATE_MODEL=none`** skips the gate, so syncs that don't change a model aren't held up.
+- **Checks are deterministic** (keywords, JSON parsing, refusal phrases, an exact-match test for the injected instruction), so the same answers always give the same verdict.
+
+### Verification
+
+| Test | Result |
+| --- | --- |
+| Golden set run locally | `gemini-small` passed; `local-small` (Qwen 0.5B on CPU) failed several cases (JSON, refusals, translation) and was blocked |
+| Gate installed with no candidate | Hook ran, logged "eval gate skipped", sync succeeded |
+| Canary to `local-small` (cost-driven switch to self-hosted) | Gate returned BLOCK, sync failed, `grid-assistant` traffic stayed entirely on the stable deployment; the proposal was reverted with `git revert`, leaving both in history |
+| Canary to `gemini-lite-v2` | Gate passed; about 10% of `grid-assistant` requests served by `grid-assistant-canary` (from `x-litellm-model-id`), comparable on the Lab 6 dashboard by model |
+| Promotion | Stable deployment switched to the candidate model, canary removed, gate re-ran against `grid-assistant` |
+| Unapproved model (`kubectl apply --dry-run=server`) | Rejected by Kyverno: no approval label, and weights from an unapproved source |
+| Governance pack | Model cards and risk assessment in `governance/`, with controls mapped to evidence from Labs 3–6 |
+
+The Git history of `apps/litellm.yaml` is the audit trail: gate installed, blocked attempt, its revert, canary, promotion.
+
+### Design decisions
+
+- **Evals run inside the cluster as a PreSync hook,** because the gateway isn't reachable from GitHub Actions. That also places the gate exactly where the change is applied, so it can't be skipped by deploying another way through Argo CD.
+- **The gate fails closed.** A missing permission, a provider outage or a hung Job all block the change rather than letting it through untested.
+- **Availability is separated from quality.** A provider outage produces INCONCLUSIVE, not a false "regression", so the gate stays trusted and nobody is tempted to bypass it.
+- **Canaries live at the gateway, behind a stable alias.** KServe's Standard mode has no traffic splitting, and the gateway works the same for self-hosted and SaaS models. Apps never change.
+- **Candidates are registered as their own alias first,** so they can be evaluated before taking any traffic.
+- **Governance is enforced, not just documented:** the eval gate in the pipeline, an approval label checked at admission, and documents that point to evidence.
+
+### Issues hit and how they were fixed
+
+- **The first canary commit seemed to change nothing.** The checks ran 20 seconds after the push, before Argo CD had polled Git (about every 3 minutes by default). The Job and the "Succeeded" status were from the previous sync. Fixed by refreshing `root` and starting the `litellm` sync explicitly through its `operation` field.
+- **Every eval case failed with HTTP 403.** The eval key's team didn't include `gemini-lite-v2`, because an earlier `team/update` ran with an empty team variable. The gate correctly blocked (fail closed). Fixed by reading the team from the key itself (`/key/info`) and updating that team.
+- **The candidate was blocked by a Gemini outage, not by quality.** Every answered case passed, but the free tier returned 503s, timeouts and 35–70 s responses. The runner gained retries with backoff and the PASS/FAIL/ERROR split with an INCONCLUSIVE verdict, and the Job deadline was raised to 30 minutes. The candidate was checked locally before re-running the gate.
+
+### What changes in production
+
+**Evals**
+
+- Larger, versioned golden sets per use case, owned with the tenant: hundreds of cases, edge cases from production incidents, and red-team prompts for injection and jailbreaks.
+- LLM-as-judge scoring for open-ended quality, alongside deterministic checks, with the judge model and rubric pinned and calibrated against human ratings.
+- Agent evals: the Lab 5 scenarios as regression tests, scored on task success, safe tool use, and approval behaviour.
+- Statistical comparison against the current stable model (not just a fixed threshold), with repeated runs to handle non-determinism.
+- Eval results stored and published with each release, for audit and trend tracking.
+
+**Rollout**
+
+- Canaries promoted automatically (for example with Argo Rollouts analysis or a controller watching the gateway's SLO metrics): step 10% → 50% → 100%, rolling back automatically on SLO burn, error-rate or cost regressions.
+- Shadow traffic (mirroring requests to the candidate without returning its answers) for higher-risk changes.
+- Prompts and agent tools versioned and gated the same way as models.
+
+**Governance**
+
+- An AI review board with an intake form; the risk tier decides how many approvals are needed and who gives them.
+- The approval label applied only by a pipeline after sign-off, never by hand, with Kyverno or Azure Policy enforcing it.
+- Model sources restricted to an internal registry, with scanning and provenance (licence, malicious files, signatures).
+- EU AI Act classification confirmed with legal. High-risk uses, such as safety components in electricity or gas supply, bring risk management, logging, human oversight and documentation duties. Mapped to ISO/IEC 42001 controls, with evidence produced automatically by the pipeline.
+- Model and provider deprecations tracked, with re-evaluation and migration ahead of shutdown dates.
