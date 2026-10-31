@@ -85,20 +85,9 @@ spec:
                 model: gemini/gemini-3.5-flash-lite
                 api_key: os.environ/GEMINI_API_KEY
                 timeout: 60
-                weight: 9
-              model_info:
-                id: grid-assistant-stable
-            - model_name: grid-assistant
-              litellm_params:
-                model: openai/qwen
-                api_base: http://qwen-predictor.team-grid.svc.cluster.local/openai/v1
-                api_key: none
-                timeout: 90
-                input_cost_per_token: 0.0000001
-                output_cost_per_token: 0.0000004
                 weight: 1
               model_info:
-                id: grid-assistant-canary
+                id: grid-assistant-stable
           router_settings:
             fallbacks:
               - local-small: [gemini-small, bedrock-small]
@@ -136,7 +125,7 @@ spec:
                         - /evals/run_evals.py
                       env:
                         - name: CANDIDATE_MODEL
-                          value: local-small
+                          value: none
                         - name: PASS_THRESHOLD
                           value: "0.9"
                         - name: GATEWAY_URL
