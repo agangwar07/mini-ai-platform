@@ -85,17 +85,9 @@ spec:
                 model: gemini/gemini-3.5-flash-lite
                 api_key: os.environ/GEMINI_API_KEY
                 timeout: 60
-                weight: 9
-              model_info:
-                id: grid-assistant-stable
-            - model_name: grid-assistant
-              litellm_params:
-                model: gemini/gemini-3.1-flash-lite
-                api_key: os.environ/GEMINI_API_KEY
-                timeout: 60
                 weight: 1
               model_info:
-                id: grid-assistant-canary
+                id: grid-assistant-stable
           router_settings:
             fallbacks:
               - local-small: [gemini-small, bedrock-small]
@@ -133,7 +125,7 @@ spec:
                         - /evals/run_evals.py
                       env:
                         - name: CANDIDATE_MODEL
-                          value: gemini-lite-v2
+                          value: grid-assistant
                         - name: PASS_THRESHOLD
                           value: "0.9"
                         - name: GATEWAY_URL
